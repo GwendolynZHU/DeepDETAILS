@@ -544,3 +544,202 @@ class DynamicDataset(Dataset):
         return (
             (seq, acc), y.sum(axis=1), y, ground_truth,
             self.get_weights(loads), misc_tuple)
+
+
+class MultiTaskSupervisedDataset(Dataset):
+    """
+    Dataset class for both one-hot encoded sequences and signal tracks
+    """
+    def __init__(self, region_bed: str, fa_file: str, 
+                 acc_bw_files: Sequence[str],
+                 pl_ct_bw_files: Sequence[str],
+                 mn_ct_bw_files: Sequence[str],
+                 cell_types: Sequence[str],
+                 is_training: int = 1,
+                 t_x: int = 4096, y_length: int = 1000,
+                 chromosomal_val: Sequence[str] = ("chr22",),
+                 chromosomal_test: Sequence[str] = ("chr19",),
+                 pos_only_subset: Optional[int] = None,
+                 subset_seed: Optional[int] = None,
+                 non_background_only: bool = False):
+        """
+        Parameters
+        ----------
+        region_bed : str
+            Path to the region bed file
+        fa_file : str
+            Path to the genome fasta file
+        acc_bw_files : Sequence[str]
+            List of paths to the accessibility bw files
+        pl_ct_bw_files : Sequence[str]
+            List of paths to the positive strand profile bw files
+        mn_ct_bw_files : Sequence[str]
+            List of paths to the negative strand profile bw files
+        cell_types : Sequence[str]
+            List of cell types corresponding to the bw files
+        is_training : int
+            0 : validation, 1 : training, 2 : testing, by default 1
+        t_x : int
+            Size of the window to extract sequences and signals
+        y_length : int
+            Length of the target signal to extract
+        chromosomal_val : Optional[Sequence[str]]
+            Chromosomes to use for validation
+        chromosomal_test : Optional[Sequence[str]]
+            Chromosomes to use for testing
+        pos_only_subset : Optional[int]
+            Set it as a positive integer if you want to sample a subset of positive regions in the training set.
+            The size of the subset will be identical with the value of this argument. By default None
+        subset_seed : Optional[int]
+            Random seed for sampling the subset of positive regions
+        non_background_only : bool
+            Set it as True if you only want to use non-background regions
+        """
+        # Region set
+        self.df = pd.read_csv(region_bed, sep="\t", header=None, usecols=[0, 1, 2])
+        self.cell_types = list(cell_types)
+
+        assert all([os.path.exists(f) for f in acc_bw_files])
+        self.acc_bw_files = acc_bw_files
+        assert all([os.path.exists(f) for f in pl_ct_bw_files])
+        self.pl_ct_bw_files = pl_ct_bw_files
+        assert all([os.path.exists(f) for f in mn_ct_bw_files])
+        self.mn_ct_bw_files = mn_ct_bw_files
+
+        # Input/output sizes
+        self._t_x = t_x
+        self.y_length = y_length
+        if self.y_length > self._t_x:
+            raise ValueError("y_length must be shorter than or equal to self.window_size")
+        self.y_offset = (self._t_x - self.y_length) // 2
+        self.n_targets = 1 if self.mn_ct_bw_files is None else 2
+        self.n_cell_types = len(self.acc_bw_files)
+
+        # Lazy-loaded file handles
+        self.fa_file = fa_file
+        self.fa_obj = None
+        self.atac_bw_objs = None
+        self.profile_bw_objs = None
+
+        # Filter regions
+        if non_background_only:
+            # self.df = self.df.loc[self.df[3] == 1].copy()
+            raise NotImplementedError("Non-background filtering is not implemented yet.\
+                                       Now no GC background is applied.")
+        if is_training == 1:
+            v_set = set(chromosomal_val) if chromosomal_val is not None else set()
+            t_set = set(chromosomal_test) if chromosomal_test is not None else set()
+            vt_chromosomes = v_set.union(t_set)
+            self.df = self.df.loc[~self.df[0].isin(vt_chromosomes), :]
+            if pos_only_subset is not None and isinstance(pos_only_subset, int) and pos_only_subset > 0:
+                if 3 not in self.df.columns:
+                    raise ValueError("Fourth column (positivity label) required for pos_only_subset.")
+                pos_df = self.df[self.df[3] == 1]
+                if pos_only_subset > pos_df.shape[0]:
+                    raise ValueError("Requested subset size exceeds available positives.")
+                self.df = pos_df.sample(n=pos_only_subset, replace=False, random_state=subset_seed)
+
+        elif is_training == 0 and chromosomal_val is not None:
+            self.df = self.df.loc[self.df[0].isin(chromosomal_val), :]
+
+        elif is_training == 2 and chromosomal_test is not None:
+            self.df = self.df.loc[self.df[0].isin(chromosomal_test), :]
+
+        self.df.reset_index(drop=True, inplace=True)
+
+    @property
+    def t_x(self):
+        return self._t_x
+
+    @property
+    def t_y(self):
+        return self.y_length
+
+    @t_y.setter
+    def t_y(self, value: int):
+        raise NotImplementedError
+    
+    def get_weights(self, observations: torch.Tensor, small: float = 1e-16):
+        safe_observations = small + observations
+        weights = safe_observations / safe_observations.sum()
+        return weights
+    
+    def __len__(self):
+        return self.df.shape[0]
+
+    def __getitem__(self, idx: int):
+        """
+        Parameters
+        ----------
+        idx : int
+            data index
+
+        Returns
+        -------
+        (seq, atac) : (torch.Tensor, torch.Tensor)
+            seq: Input tensor of shape (4, self.t_x), rows are ordered by ACGT.
+            atac: Input tensor of shape (self.n_cell_types, self.t_x), Cell type-specific accessibility signal.
+        counts : torch.Tensor
+            Strand-specific read counts for each target.
+            Shape: (self.n_cell_types, self.n_targets)
+        profiles : torch.Tensor
+            Strand-specific counts profile for each target.
+            Shape: (self.n_cell_types, self.n_targets, self.t_y)
+        loads : torch.Tensor
+            ATAC loads for each cluster.
+            Shape: (self.n_cell_types)
+        """
+        # Lazy-load I/O objects
+        if self.fa_obj is None:
+            self.fa_obj = pyfaidx.Fasta(self.fa_file)
+
+        if self.atac_bw_objs is None:
+            self.atac_bw_objs = {
+                ct: pyBigWig.open(f) for ct, f in zip(self.cell_types, self.acc_bw_files)
+            }
+
+        if self.profile_bw_objs is None:
+            self.profile_bw_objs = {
+                ct: (pyBigWig.open(pl), pyBigWig.open(mn)) 
+                for ct, (pl, mn) in zip(self.cell_types, zip(self.pl_ct_bw_files, self.mn_ct_bw_files))
+            }
+
+        hit = self.df.iloc[idx]
+        chrom, start, end = hit[0], hit[1], hit[2]
+
+        center = (start + end) // 2
+
+        window_start = center - self.t_x // 2
+        window_end = window_start + self.t_x
+        y_start = window_start + self.y_offset
+        y_end = window_end - self.y_offset
+
+        # Sequence
+        seq = self.fa_obj[chrom][window_start:window_end].seq
+        seq_tensor = torch.tensor(seq_to_one_hot(seq), dtype=torch.float32)  # (4, window_size)
+
+        # ATAC signals: stack per cell type
+        atac_tensor = torch.stack([
+            torch.tensor(extract_signal_from_bw(self.atac_bw_objs[ct], chrom, window_start, window_end)) 
+            for ct in self.cell_types])  # (n_cell_types, 1, window_size)
+
+        # ATAC loads
+        loads = torch.zeros(self.n_cell_types)
+        for i in range(self.n_cell_types):
+            loads[i] = atac_tensor[i, :].mean()
+
+        # Profiles: stack per cell type
+        profile_tensors = []
+        counts_tensors = []
+        for ct in self.cell_types:
+            pl_bw, mn_bw = self.profile_bw_objs[ct]
+            profile = torch.stack([torch.tensor(extract_signal_from_bw(pl_bw, chrom, y_start, y_end)),
+                      torch.tensor(extract_signal_from_bw(mn_bw, chrom, y_start, y_end))]) # (2, y_length)
+
+            profile_tensors.append(profile.clone().detach())
+            counts_tensors.append(profile.sum(axis=1).clone().detach())  # (2,)
+
+        profiles_tensor = torch.stack(profile_tensors, dim=0)  # (n_cell_types, 2, y_length)
+        counts_tensor = torch.stack(counts_tensors, dim=0)     # (n_cell_types, 2)
+
+        return (seq_tensor, atac_tensor), counts_tensor, profiles_tensor, self.get_weights(loads)
