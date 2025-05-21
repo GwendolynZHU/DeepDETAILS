@@ -166,6 +166,89 @@ def get_trainer(study_name: str, save_to: str = ".", min_delta: float = 0, early
     return trainer_obj, wbl.version
 
 
+def get_suprv_trainer(study_name: str, save_to: str = ".", min_delta: float = 0, earlystop_patience: int = 3,
+                max_epochs: int = 200, save_top_k_model: Union[str, int] = 1, hide_progress_bar: bool = False,
+                model_summary_depth: int = 6, version: Optional[str] = None, accelerator: Optional[str] = "auto",
+                devices: Union[List[int], str, int] = "auto", wandb_project: Optional[str] = None,
+                wandb_entity: Optional[str] = None, wandb_upload_model: Union[str, bool] = False,
+                pass_mark: str = "1st") -> Tuple[pl.Trainer, str]:
+    """
+    Get pl.Trainer for training / inference, etc.
+
+    Parameters
+    ----------
+    study_name : str
+        {study_name}
+    save_to : str
+        {save_to}
+    min_delta : float
+        {min_delta}
+    earlystop_patience : int
+        {earlystop_patience}
+    max_epochs : int
+        {max_epochs}
+    save_top_k_model : Union[str, int]
+        {save_top_k_model}
+    hide_progress_bar : bool
+        {hide_progress_bar}
+    model_summary_depth : int
+        {max_depth}
+    version : Optional[str]
+        {wandb_version}
+    accelerator : Optional[str]
+        {accelerator}
+    devices : Union[List[int], str, int]
+        {devices}
+    wandb_project : Optional[str]
+        {wandb_project}
+    wandb_entity : Optional[str]
+        {wandb_entity}
+    wandb_upload_model : Union[str, int]
+        {wandb_upload_model}
+    pass_mark
+
+    Returns
+    -------
+    trainer_obj : pl.Trainer
+        Lightning Trainer object
+    wbl.version : str
+        Final effective WandB version string
+    """.format(**PARAM_DESC)
+    training_readout = "val_loss"
+    # avoid reuse run records
+    wandb.finish()
+
+    pass_str = f"_{pass_mark}" if pass_mark else ""
+    ver_str = f"{version}{pass_str}" if version else datetime.now().strftime("%y%m%d%H%M%S")
+    wbl = WandbLogger(name=f"{study_name}{pass_str}", project=wandb_project, version=ver_str,
+                      reinit=True, entity=wandb_entity,
+                      log_model=wandb_upload_model, save_dir=save_to, offline=True,
+                      settings=wandb.Settings(start_method="fork"))
+    csvl = CSVLogger(name=f"{study_name}{pass_str}", version=wbl.version, save_dir=save_to,
+                     prefix=f"{study_name}{pass_str}")
+
+    checkpoint_callback = ModelCheckpoint(monitor=training_readout, save_top_k=save_top_k_model,
+                                          dirpath=os.path.join(save_to, study_name, str(wbl.version)))
+    early_stop_callback = EarlyStopping(
+        monitor=training_readout, min_delta=min_delta,
+        patience=earlystop_patience, verbose=True, mode="min"
+    )
+    callbacks = [early_stop_callback,
+                 checkpoint_callback,
+                 ModelSummary(max_depth=model_summary_depth),]
+    if accelerator == "cpu" and isinstance(devices, list):
+        devices = devices[0]
+    trainer_obj = pl.Trainer(
+        logger=[wbl, csvl],
+        enable_checkpointing=True,
+        max_epochs=max_epochs,
+        accelerator=accelerator, devices=devices,
+        callbacks=callbacks,
+        enable_progress_bar=False if hide_progress_bar else True
+    )
+    return trainer_obj, wbl.version
+
+
 def internal_qc(metrics: list[float], pred_counts: torch.Tensor):
     """
     Run internal QC to determine if the deconvolution is sound
@@ -427,11 +510,11 @@ def bedgraph_to_bigwig(in_bedgraph_path: str, out_bigwig_path: str, chrom_size_p
         run_command(cmd, raise_exception=True)
     except RuntimeError as e:
         if str(e).find("not case-sensitive sorted") != -1:
-            cmd1 = f"sort -k1,1 -k2,2n {in_bedgraph_path} > {in_bedgraph_path}.sorted"
+            cmd1 = f"LC_COLLATE=C sort -k1,1 -k2,2n {in_bedgraph_path} > {in_bedgraph_path}.sorted"
             run_command(cmd1, raise_exception=True)
             cmd = f"bedGraphToBigWig {in_bedgraph_path}.sorted {chrom_size_path} {out_bigwig_path}"
             run_command(cmd, raise_exception=True)
-            os.remove(f"rm {in_bedgraph_path}.sorted")
+            os.remove(f"{in_bedgraph_path}.sorted")
         else:
             raise e
 
