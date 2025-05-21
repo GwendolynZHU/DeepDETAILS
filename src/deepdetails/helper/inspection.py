@@ -1,7 +1,7 @@
 import os
 import torch
 import matplotlib.pyplot as plt
-from typing import Union
+from typing import Union, Optional
 from deepdetails.helper.utils import get_log_dir
 
 
@@ -42,9 +42,8 @@ def bulk_visual_inspection(y_hats: torch.Tensor, y: torch.Tensor,
 
     Parameters
     ----------
-    y_hats : list[torch.Tensor]
-        List of prediction, one element is the prediction for one
-        learning target
+    y_hats : torch.Tensor
+        Predictions. Shape: cluster, batch, strands, seq_len
     y : torch.Tensor
         Truth (learning targets)
     per_cluster_y_hats : Union[None, torch.Tensor]
@@ -98,6 +97,77 @@ def bulk_visual_inspection(y_hats: torch.Tensor, y: torch.Tensor,
     plt.close()
 
 
+def gt_visual_inspection(y_hats: torch.Tensor, y: torch.Tensor,
+                         prefix: str = ".", logger: Union[None, callable] = None,
+                         cell_type_names: Optional[list] = None):
+    """Generate a snapshot of the predicted bulk vs. input bulk
+
+    Parameters
+    ----------
+    y_hats : torch.Tensor
+        Predictions. Shape: cluster, batch, strands, seq_len
+    y : torch.Tensor
+        Truth (learning targets)
+
+    prefix : str
+        Prefix to the output file, default ""
+    logger : Union[None, callable]
+        Logger instances
+    cell_type_names : Optional[list]
+        List of cell type names for the y_hats tensor. If None, the default names will be used.
+
+    Returns
+    -------
+
+    """
+    assert y.shape == y_hats.shape, "Shape mismatch between y and y_hats"
+    n_cell_types, batch_size, strands, seq_len = y_hats.shape
+    sample_id = torch.randint(batch_size, (1, 1))[0, 0].item()
+    detached_y = y.detach().cpu().numpy()
+    detached_y_hat = y_hats.detach().cpu().numpy()
+
+    fig, axs = plt.subplots(n_cell_types * 2, 1, sharex=True, figsize=(5, 0.6 * n_cell_types * 2))
+    pred_rows = []
+    truth_rows = []
+    for i in range(n_cell_types):
+        true_signal = detached_y[i, sample_id, :, :]
+        pred_signal = detached_y_hat[i, sample_id]
+
+        # Ground truth
+        ax_true = axs[2 * i]
+        truth_rows.append(2 * i)
+        ax_true.plot(true_signal[0], color="#FF0D57")
+        ax_true.plot(-true_signal[1], color="#1E88E5")
+        label = cell_type_names[i] if cell_type_names else f"CT {i}"
+        ax_true.set_ylabel(f"Y\n{label}")
+        ax_true.spines["top"].set_visible(False)
+        ax_true.spines["right"].set_visible(False)
+
+        # Prediction
+        ax_pred = axs[2 * i + 1]
+        pred_rows.append(2 * i + 1)
+        ax_pred.plot(pred_signal[0], color="#FF0D57")
+        ax_pred.plot(-pred_signal[1], color="#1E88E5")
+        ax_pred.set_ylabel(r"$\hat{Y}$" + "\n" + label)
+        ax_pred.spines["top"].set_visible(False)
+        ax_pred.spines["right"].set_visible(False)
+
+    _share_ylim(axs, pred_rows)
+    _share_ylim(axs, truth_rows)
+
+    fig.align_ylabels()
+    plt.tight_layout()
+
+    # Save the figure
+    dest_folder, version = get_log_dir(logger)
+    os.makedirs(dest_folder, exist_ok=True)
+
+    dest = os.path.join(dest_folder, f"{prefix}{sample_id}{version}.png")
+    
+    plt.savefig(dest, dpi=200)
+    plt.close()
+
+    
 def per_cluster_visual_inspection(
         y_hats: torch.Tensor, per_cluster_y_hats: torch.Tensor,
         y: torch.Tensor, per_cluster_y: torch.Tensor,
