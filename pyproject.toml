@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "DeepDETAILS"
+name = "deepdetails"
 dynamic = ["version"]
 description = "Deep-learning-based DEconvolution of Tissue profiles with Accurate Interpretation of Locus-specific Signals"
 readme = "README.md"
@@ -39,6 +39,9 @@ deepdetails = "deepdetails.cli:deepdetails"
 Documentation = "https://github.com/liyao001/DeepDETAILS"
 Issues = "https://github.com/liyao001/DeepDETAILS/issues"
 Source = "https://github.com/liyao001/DeepDETAILS"
+
+[tool.hatch.build]
+sources = ["src"]
 
 [tool.hatch.version]
 path = "src/deepdetails/__about__.py"
