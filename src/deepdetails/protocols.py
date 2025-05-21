@@ -13,15 +13,197 @@ from tqdm import tqdm
 from pytorch_lightning.utilities import move_data_to_device
 from deepdetails.par_description import PARAM_DESC
 from deepdetails.__about__ import __version__
-from deepdetails.helper.utils import get_trainer, slugify, internal_qc, rescaling_prediction, compare_dicts
-from deepdetails.model.wrapper import DeepDETAILS
-from deepdetails.data import SequenceSignalDataset, DynamicDataset
+from deepdetails.helper.utils import get_trainer, get_suprv_trainer, slugify, internal_qc, rescaling_prediction, compare_dicts, calc_counts_per_locus
+from deepdetails.model.wrapper import DeepDETAILS, SupervisedDeepDETAILS
+from deepdetails.data import SequenceSignalDataset, DynamicDataset, MultiTaskSupervisedDataset
 from deepdetails.helper.prep_ds import (extend_regions_from_mid_points, combine_regions, generate_gc_matched_random_regions,
                                         build_data_volume, convert_bulk_frags_to_ct_frags, frag_file_to_bw)
 from deepdetails.helper.preflight import preflight_check
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(levelname)s | %(asctime)s | %(message)s", level=logging.INFO)
+
+    
+def superv_contrastive(regions: str, fa_file: str, acc_bw_files: str, pl_ct_bw_files: Sequence[str],
+           mn_ct_bw_files: Sequence[str], cell_types: Sequence[str], save_to: str, 
+           study_name: str, batch_size: int, num_workers: int, min_delta: float,
+           save_preds: bool, chrom_cv: bool, y_length: int, earlystop_patience: int,
+           max_epochs: int, save_top_k_model: int, model_summary_depth: int, hide_progress_bar: bool,
+           accelerator: str, devices: str, version: str, wandb_project: Optional[str], wandb_entity: Optional[str],
+           gamma: float, wandb_upload_model: bool, profile_shrinkage: int, filters: int, n_non_dil_layers: int,
+           non_dil_kernel_size: int, n_dilated_layers: int, dil_kernel_size: int, head_layers: int,
+           conv1_kernel_size: int, gru_layers: int, gru_dropout: float, profile_kernel_size: int,
+           redundancy_loss_coef: float, prior_loss_coef: float, rescaling_mode: int,
+           scale_function_placement: str, learning_rate: float, betas: Tuple[float, float],
+           window_size: int = 4096, all_regions: bool = True, test_pos_only: bool = True, max_retry: int = 3,
+           cv: Sequence[str] = ("chr22",), ct: Sequence[str] = ("chr19",), n_times_more_embeddings: int = 2,
+           seq_only: Optional[bool] = False, loads_trunc: Optional[int] = None):
+    """
+    Use supervised contrastive learning to train a model with DETAILS previous architecture designs.
+    """
+    logger.info(f"Running supervised contrastive DeepDETAILS on sample {regions} (software version: {__version__})")
+    if seq_only:
+        logger.info("Supervised contrastive deepDETAILS is running in sequence only mode")
+    if chrom_cv:
+        logger.info(f"Using {cv} for validation and {ct} for testing")
+    ds = MultiTaskSupervisedDataset(
+        regions, fa_file, acc_bw_files, pl_ct_bw_files, mn_ct_bw_files, cell_types, y_length=y_length, is_training=1, non_background_only=not all_regions,
+        chromosomal_val=cv if chrom_cv else None, chromosomal_test=ct if chrom_cv else None,
+    )
+    val_ds = MultiTaskSupervisedDataset(
+        regions, fa_file, acc_bw_files, pl_ct_bw_files, mn_ct_bw_files, cell_types, y_length=y_length, is_training=0,
+        chromosomal_val=cv if chrom_cv else None, chromosomal_test=ct if chrom_cv else None,
+    )
+    test_ds = MultiTaskSupervisedDataset(
+        regions, fa_file, acc_bw_files, pl_ct_bw_files, mn_ct_bw_files, cell_types, y_length=y_length, is_training=2,
+        chromosomal_val=cv if chrom_cv else None, chromosomal_test=ct if chrom_cv else None,
+    )
+    logger.info(f"Sample {regions} has {ds.n_cell_types} cell types")
+    
+    # export_multitask_predictions(SupervisedDeepDETAILS, 
+    #                          dataset=test_ds, 
+    #                          checkpoint="/fs/cbsuhy01/storage/yz2676/data/DetailedProCapNet/wdir/deepdetails/superv_contrast/Superv_fused_with_scaling/250508102626/epoch=5-step=30276.ckpt",
+    #                          batch_size=batch_size,
+    #                          num_workers=num_workers,
+    #                          save_to=save_to,
+    #                          cell_types=cell_types,
+    #                          y_length=y_length, 
+    #                          study_name=study_name,
+    #                          device=f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu")
+    
+    train_iter = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                            num_workers=num_workers, pin_memory=True)
+    val_iter = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    test_iter = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    # generate roughly 10 screenshots
+    test_screenshots_ratio = 10 / len(test_iter)
+
+    retry = 0
+    max_retry = max(max_retry, 1)
+
+    while retry < max_retry:
+        if retry > 0:
+            version_str = f"{version}-{retry}"
+        else:
+            version_str = version
+        trainer, ver = get_suprv_trainer(
+            study_name=study_name, save_to=save_to, min_delta=min_delta, earlystop_patience=earlystop_patience,
+            max_epochs=max_epochs, save_top_k_model=save_top_k_model, hide_progress_bar=hide_progress_bar,
+            model_summary_depth=model_summary_depth, version=version_str, accelerator=accelerator,
+            devices=devices, wandb_project=wandb_project,
+            wandb_entity=wandb_entity, wandb_upload_model=wandb_upload_model, pass_mark="")
+
+        model = SupervisedDeepDETAILS(num_cell_types=ds.n_cell_types, filters=filters,
+                            n_non_dil_layers=n_non_dil_layers, non_dil_kernel_size=non_dil_kernel_size,
+                            n_dil_layers=n_dilated_layers, dil_kernel_size=dil_kernel_size,
+                            conv1_kernel_size=conv1_kernel_size, profile_shrinkage=profile_shrinkage,
+                            profile_kernel_size=profile_kernel_size, head_mlp_layers=head_layers,
+                            redundancy_loss_coef=redundancy_loss_coef, prior_loss_coef=prior_loss_coef,
+                            scale_function_placement=scale_function_placement, num_tasks=ds.n_targets,
+                            gru_layers=gru_layers, gru_dropout=gru_dropout,
+                            n_times_more_embeddings=n_times_more_embeddings,
+                            learning_rate=learning_rate, betas=betas,
+                            version=ver, t_x=ds.t_x, test_screenshot_ratio=test_screenshots_ratio,
+                            gamma=gamma, seq_only=seq_only)
+
+        logger.info("Start building model...")
+        trainer.fit(model, train_dataloaders=train_iter, val_dataloaders=val_iter)
+
+        logger.info("Evaluating model's performances...")
+        trainer.test(model, test_iter)
+        break
+
+        # skip QC
+        # # abnormality detection
+        # # we expect the similarity between predictions to have a decreasing trend
+        # # if not, it suggests model may be collapsed
+        # qc_val, brc_qc_res, sum_qc_res = internal_qc(model.self_qc_values, model.sum_qc_metrics)
+        # # only use sum_qc_res when test steps were called
+        # if not model.enable_sum_qc_metrics:
+        #     logger.warning("Bypassing sum-based QC since test loop was not triggered")
+        #     final_sum_qc_res = True
+        # else:
+        #     final_sum_qc_res = sum_qc_res
+        # if brc_qc_res and final_sum_qc_res:
+        #     logger.info(f"Model passed self QC (self QC value: {qc_val})")
+        #     break
+        # else:
+        #     logger.warning(f"Model collapsed (self QC value: {qc_val[0]} - {brc_qc_res}; {qc_val[1]} - {sum_qc_res})")
+        #     ckpt_path = getattr(trainer.checkpoint_callback, "best_model_path", None)
+        #     if ckpt_path is not None and os.path.exists(ckpt_path):
+        #         logger.warning(
+        #             f"Deleting model file {ckpt_path} from the collapsed run")
+        #         os.remove(ckpt_path)
+        #     logger.info("Trying to rerun the deconvolution process...")
+        # retry += 1
+    
+    if save_preds:
+        ckpt_path = getattr(trainer.checkpoint_callback, "best_model_path", None)
+        if os.path.exists(ckpt_path):
+            logger.info(f"Exporting predictions using checkpoint from {ckpt_path}...")
+            export_multitask_predictions(SupervisedDeepDETAILS, test_ds, ckpt_path, batch_size, num_workers=num_workers,
+                           save_to=save_to, cell_types=cell_types, study_name=study_name,
+                           y_length=y_length, device=f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu")
+        else:
+            logger.warning(f"Checkpoint file {ckpt_path} doesn't exist anymore... Maybe model collapsed?")
+
+
+def export_multitask_predictions(model: pl.LightningModule, dataset: Union[callable, str], checkpoint: str,
+                                  batch_size: int, num_workers: int, save_to: str, cell_types: Sequence[str],
+                                  y_length: int, study_name: str, device: str, save_npy: bool = True):
+
+    model = model.load_from_checkpoint(checkpoint).to(device).eval()
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+
+    # One list per cell type
+    profile_preds = [[] for _ in cell_types]
+    count_preds = [[] for _ in cell_types]
+    region_names = []
+
+    for batch_idx, batch in enumerate(dataloader):
+        (seq, atac), _, _, loads = batch
+        seq, atac, loads = seq.to(device), atac.to(device), loads.to(device)
+
+        pc_profiles, pc_counts, _, _ = model((seq, atac), loads)
+
+        ct_preds = calc_counts_per_locus(pc_profiles, pc_counts, True)
+
+        # track region coordinates from dataset
+        start_idx = batch_idx * batch_size
+        for i in range(seq.shape[0]):
+            row = dataset.df.iloc[start_idx + i]
+            chrom, start, end = row[0], row[1], row[2]
+            center = (start + end) // 2
+            y_offset = y_length // 2
+            region_names.append(f"{chrom}:{center-y_offset}-{center+y_offset}")
+
+        for i, ct in enumerate(cell_types):
+            # Append to the list
+            profile_preds[i].append(ct_preds[i].detach().cpu().numpy())
+            count_preds[i].append(pc_counts[i].detach().cpu().numpy())  
+
+    # Save
+    combined_counts_dict = {}
+    for i, ct in enumerate(cell_types):
+        prof_np = np.concatenate(profile_preds[i], axis=0)  # (n_regions, 2, 1000)
+        count_np = np.concatenate(count_preds[i], axis=0)   # (n_regions, 2)
+
+        # Save npy
+        np.save(os.path.join(save_to, f"{study_name}.{ct}.profiles.npy"), prof_np)
+        np.save(os.path.join(save_to, f"{study_name}.{ct}.counts.npy"), count_np)
+
+        total_counts = np.sum(count_np, axis=1)
+        combined_counts_dict[ct] = total_counts
+
+    # Save counts to CSV
+    df_all_counts = pd.DataFrame(combined_counts_dict, index=region_names)
+    counts_file = os.path.join(
+        save_to,
+        "counts.csv.gz" if study_name == "" else f"{slugify(study_name)}.counts.csv.gz"
+    )
+    df_all_counts.to_csv(counts_file)
 
 
 def deconv(dataset: str, save_to: str, study_name: str, batch_size: int, num_workers: int, min_delta: float,
@@ -534,7 +716,8 @@ def prepare_dataset(regions: Sequence[str], bulk_pl: str, save_to: str, window_s
         final_regions.to_csv(os.path.join(save_to, "regions.csv"), header=False, index=False)
     else:
         final_regions = pd.read_csv(regions if isinstance(regions, str) else regions[0],
-                                    comment="#", header=None)
+                                    comment="#", header=None, sep="\t")
+    print(final_regions)
 
     if fragments is not None:
         if barcodes is None:
@@ -577,6 +760,14 @@ def prepare_dataset(regions: Sequence[str], bulk_pl: str, save_to: str, window_s
                 for ct in glob(f"{save_to}/*.fragments.tsv"):
                     os.remove(ct)
 
+    barcodes = pd.read_csv(barcodes, sep="\t", header=None)
+    if barcodes.shape[1] != 2:
+        raise ValueError("barcode_file should have 2 columns: the cell barcode and cell type annotation")
+    cell_types = sorted(barcodes[1].unique().tolist())
+    ref_labels = list([slugify(ct) for ct in cell_types])
+    accessibility = []
+    for ct in ref_labels:
+        accessibility.append(f"{save_to}/{ct}.fragments.bw")
     # reference
     pl_refs = []
     mn_refs = []
@@ -587,6 +778,7 @@ def prepare_dataset(regions: Sequence[str], bulk_pl: str, save_to: str, window_s
                 pl_refs.append(plf)
                 mn_refs.append(mnf)
 
+    print("window_size", window_size)
     build_data_volume(final_regions, [bulk_pl, ], [bulk_mn, ] if bulk_mn is not None else [],
                       accessibility, window_size, save_to, genome_fa, pl_refs, mn_refs,
                       target_sliding_sum=target_sliding_sum)
