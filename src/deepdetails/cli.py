@@ -3,7 +3,7 @@ import os
 from glob import glob
 from deepdetails.__about__ import __version__
 from deepdetails.par_description import PARAM_DESC
-from deepdetails.protocols import deconv, prepare_dataset, export_results, export_wg_results, pred_to_bw, merge_rep_preds
+from deepdetails.protocols import deconv, superv_contrastive, prepare_dataset, export_results, export_wg_results, pred_to_bw, merge_rep_preds
 from deepdetails.model.wrapper import DeepDETAILS
 from deepdetails.helper.utils import is_valid_file
 
@@ -19,6 +19,70 @@ def _general_parser(parent_parser: argparse.ArgumentParser):
                        type=int, default=32)
     group.add_argument("--hide-progress-bar", action="store_true", help=PARAM_DESC["hide_progress_bar"])
     group.add_argument("--version", action="version", version=__version__)
+
+
+def _supervised_training_parser(parent_parser: argparse.ArgumentParser):
+    group = parent_parser.add_argument_group("Supervised Training")
+    group.add_argument("--regions", required=True, type=str,
+                        help=PARAM_DESC["regions"])
+    group.add_argument("--fa_file", required=True, type=str,
+                        help=PARAM_DESC["fa_file"])
+    group.add_argument("--accessibility", dest="acc_bw_files", nargs="+",
+                       type=lambda _x: is_valid_file(_x), help=PARAM_DESC["accessibility"])
+    group.add_argument("--ref-pls", dest="pl_ct_bw_files", nargs="+",
+                       type=lambda _x: is_valid_file(_x), help=PARAM_DESC["ref_pls"])
+    group.add_argument("--ref-mns", dest="mn_ct_bw_files", nargs="+",
+                       type=lambda _x: is_valid_file(_x), help=PARAM_DESC["ref_mns"])
+    group.add_argument("--ref-labels", dest="cell_types", nargs="+",
+                       type=str, help=PARAM_DESC["ref_labels"])
+    group.add_argument("--window-size", default=4096, type=int, help=PARAM_DESC["t_x"])
+    group.add_argument("--chrom-cv", action="store_true", 
+                       help=PARAM_DESC["chrom_cv"], default=True)
+    group.add_argument("--chromosomal-validation", "--cv", dest="cv", default=("chr22",),
+                       help=PARAM_DESC["chromosomal_validation"], nargs="+")
+    group.add_argument("--chromosomal-testing", "--ct", dest="ct", default=("chr19",),
+                       help=PARAM_DESC["chromosomal_testing"], nargs="+")
+    group.add_argument("--accelerator", type=str, default="auto",
+                       choices=("gpu", "tpu", "auto", "cpu", "ipu"), help=PARAM_DESC["accelerator"])
+    group.add_argument("--devices", help=PARAM_DESC["devices"],
+                       nargs="*", type=int, default=(0,))
+    group.add_argument("--earlystop-patience", help=PARAM_DESC["earlystop_patience"],
+                       type=int, default=2)
+    group.add_argument("--min-delta", help=PARAM_DESC["min_delta"],
+                       type=float, default=0.0001)
+    group.add_argument("--max-epochs", help=PARAM_DESC["max_epochs"],
+                       type=int, default=50)
+    group.add_argument("--save-top-k-model", help=PARAM_DESC["save_top_k_model"],
+                       default=1, type=int)
+    # for backward compatibility
+    g = group.add_mutually_exclusive_group()
+    g.add_argument("--save-preds", action="store_true", default=True, help=PARAM_DESC["save_preds"])
+    g.add_argument("--no-preds", action="store_false", dest="save_preds", help=PARAM_DESC["no_preds"])
+    group.add_argument("--redundancy-loss-coef", help=PARAM_DESC["redundancy_loss_coef"],
+                       type=float, default=1.0)
+    group.add_argument("--prior-loss-coef", help=PARAM_DESC["prior_loss_coef"],
+                       type=float, default=1.0)
+    group.add_argument("--gamma", help=PARAM_DESC["gamma"],
+                       type=float, default=1e-8)
+    group.add_argument("--learning-rate", help=PARAM_DESC["learning_rate"],
+                       type=float, default=1e-3)
+    group.add_argument("--betas", help=PARAM_DESC["betas"],
+                       type=float, default=(0.9, 0.999), nargs=2)
+    group.add_argument("--model-summary-depth", help=PARAM_DESC["max_depth"],
+                       type=int, default=1)
+    group.add_argument("--max-retry", help=PARAM_DESC["max_retry"],
+                       type=int, default=3)
+    group.add_argument("--rescaling-mode", dest="rescaling_mode", help=PARAM_DESC["rescaling_mode"],
+                       choices=(0, 1, 2), default=1, type=int)
+    # for backward compatibility
+    g = group.add_mutually_exclusive_group()
+    g.add_argument("--all-regions", action="store_true", help=PARAM_DESC["all_regions"], default=True)
+    g.add_argument("--peak-only", action="store_false", dest="all_regions", help=PARAM_DESC["peak_only"])
+    group.add_argument("--test-all-regions", dest="test_pos_only", action="store_false",
+                        help=PARAM_DESC["test_pos_only"])
+    group.add_argument("-v", "--version-tag", dest="version", help=PARAM_DESC["wandb_version"],
+                       type=str, default="")
+    group.add_argument("--loads-trunc", required=False, type=int, help=PARAM_DESC["loads_trunc"])
 
 
 def _training_parser(parent_parser: argparse.ArgumentParser):
@@ -255,6 +319,13 @@ def deepdetails():
     parser.add_argument("-v", "--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(title="Available functions", dest="function")
 
+    # Subparser for supervised training
+    parser_train = subparsers.add_parser("superv_contrast", help="Train DeepDETAILS with reference datasets")
+    _general_parser(parser_train)
+    _supervised_training_parser(parser_train)
+    _model_conf_parser(parser_train)
+    _wandb_parser(parser_train)
+
     # Subparser for deconvolution
     parser_deconv = subparsers.add_parser("deconv", help="Using DeepDETAILS to deconvolve a bulk sample")
     _general_parser(parser_deconv)
@@ -291,6 +362,8 @@ def deepdetails():
 
     if args.function == "deconv":
         deconv(**args_dict)
+    elif args.function == "superv_contrast":
+        superv_contrastive(**args_dict)
     elif args.function == "prep-data":
         if args.fragments and args.barcodes is None:
             parser.error("--fragments requires --barcodes to be specified")
