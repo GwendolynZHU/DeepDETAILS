@@ -282,3 +282,114 @@ class Regressor(nn.Module):
             per_cluster_activations.append(gates)
 
         return per_cluster_profiles, per_cluster_counts, cluster_weights, per_cluster_activations
+
+
+class SupervisedRegressor(nn.Module):
+    def __init__(self, num_cell_types: int, profile_shrinkage=8, filters=512, n_non_dil_layers=0, non_dil_kernel_size=3,
+                 n_dil_layers=8, dil_kernel_size=3, conv1_kernel_size=21, profile_kernel_size=75,
+                 counts_head_mlp_layers=3, num_tasks=2, gru_layers=1, gru_dropout=0.1,
+                 n_times_more_embeddings=2, scale_function_placement: str = "disable") -> None:
+        
+        super().__init__()
+        self.num_cell_types = num_cell_types
+        n_profile_filters = int(filters / profile_shrinkage)
+        
+        # Shared motif detector
+        self.motif_detector = nn.Sequential(nn.Conv1d(
+            4, filters, kernel_size=conv1_kernel_size, padding="valid"))
+        
+        for _ in range(n_non_dil_layers):
+            self.motif_detector.append(
+                ResidualConv(filters=filters, kernel_size=non_dil_kernel_size,
+                             dilation_rate=1)
+            )
+
+        for i in range(n_dil_layers):
+            if i < n_dil_layers - 1:
+                self.motif_detector.append(
+                    ResidualConv(filters=filters, kernel_size=dil_kernel_size,
+                                 dilation_rate=2 ** (i + 1))
+                )
+            else:
+                self.motif_detector.append(
+                    ResidualConvWithXProjection(filters=filters * n_times_more_embeddings, kernel_size=dil_kernel_size,
+                                                dilation_rate=2 ** (i + 1))
+                )
+        
+        # Shared GRU for profile refinement
+        self.filter_gates = nn.ModuleList(
+            [nn.LazyLinear(filters * n_times_more_embeddings, bias=False) for _ in range(num_cell_types)])
+
+        self.profile_refiner = nn.GRU(input_size=1, hidden_size=n_profile_filters,
+                                      num_layers=gru_layers, dropout=gru_dropout,
+                                      batch_first=True, bidirectional=True)
+        
+        # Per cell type heads
+        self.per_cell_type_heads = nn.ModuleList()
+        for _ in range(self.num_cell_types):
+            self.per_cell_type_heads.append(
+                PerClusterHead(
+                    shape_filters=filters, profile_kernel_size=profile_kernel_size,
+                    counts_head_mlp_layers=counts_head_mlp_layers, num_tasks=num_tasks
+                ))
+            
+        self.scale_function_placement = scale_function_placement
+
+    def forward(self, x: Tuple[torch.Tensor, torch.Tensor], per_cluster_load: torch.Tensor) -> tuple[
+        list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """Forward propagation
+
+        Parameters
+        ----------
+        x : Tuple[torch.Tensor, torch.Tensor]
+            seq: Shape: batch, ATCG, window_size
+            atac: Shape: batch, n_cell_types, window_size
+        per_cluster_load : torch.Tensor
+            Prior about per cluster loads
+
+        Returns
+        -------
+        tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]
+            1. First element is per cell type profile (Shape: batch, strands, window_size).
+            2. Second element is per cell type counts (Shape: batch, strands).
+            3. Per cell type motif gates (Shape: batch, filters)
+            Elements in per cell type profiles can be directly used for the imputation of
+            pseudo-bulk initiation patterns.
+        """
+        seq, atac = x
+        motifs = self.motif_detector(seq) # shape: batch, filter_1 (1024), seq_len
+        motifs_gap = motifs.mean(axis=2) # shape: batch, filter_1 (1024)
+        atac_truncation = (atac.shape[-1] - motifs.shape[-1]) // 2
+
+        cluster_weights = per_cluster_load
+        per_cell_type_profiles = []
+        per_cell_type_counts = []
+        per_cell_type_activations = []
+
+        for cell_type_id in range(self.num_cell_types):
+            cw = cluster_weights[:, cell_type_id]
+            profiles, _ = self.profile_refiner(atac[:, cell_type_id, :].unsqueeze(2)) # shape: batch, seq_len, filters_2 (128)
+            profiles = torch.swapaxes(profiles, 1, 2)[:, :, atac_truncation:-atac_truncation]
+            
+            gates = torch.sigmoid(self.filter_gates[cell_type_id](motifs_gap)) # shape: batch, filters_1 (1024)
+            filtered_activations = motifs * gates[:, :, None]
+            
+            if self.scale_function_placement == "early":
+                per_cell_type_profile, per_cell_type_count = self.per_cell_type_heads[cell_type_id](
+                    (filtered_activations * cw[:, None, None], profiles))
+            else:
+                per_cell_type_profile, per_cell_type_count = self.per_cell_type_heads[cell_type_id](
+                    (filtered_activations, profiles))
+            cw = cw.to(per_cell_type_count.device)
+            if self.scale_function_placement == "late":
+                per_cell_type_profiles.append(per_cell_type_profile * cw[:, None, None])
+                per_cell_type_counts.append(per_cell_type_count * cw[:, None])
+            elif self.scale_function_placement == "late-ch":
+                per_cell_type_profiles.append(per_cell_type_profile)
+                per_cell_type_counts.append(per_cell_type_count * cw[:, None])
+            else:
+                per_cell_type_profiles.append(per_cell_type_profile)
+                per_cell_type_counts.append(per_cell_type_count)
+            per_cell_type_activations.append(gates)
+
+        return per_cell_type_profiles, per_cell_type_counts, cluster_weights, per_cell_type_activations
