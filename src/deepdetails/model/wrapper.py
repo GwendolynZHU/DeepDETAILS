@@ -5,7 +5,7 @@ from typing import Tuple, Optional
 from einops import rearrange
 from deepdetails.helper.inspection import bulk_visual_inspection, per_cluster_visual_inspection, gt_visual_inspection
 from deepdetails.model.loss import RMSLELoss, off_diagonal
-from deepdetails.model.deconvolution import Regressor, SeqOnlyRegressor, SupervisedRegressor
+from deepdetails.model.deconvolution import Regressor, SeqOnlyRegressor, SupervisedRegressor, SupervisedSeqOnlyRegressor, SupervisedFiLMRegressor
 from deepdetails.helper.utils import transform_counts, calc_counts_per_locus
 from deepdetails.par_description import PARAM_DESC
 
@@ -19,7 +19,9 @@ class SupervisedDeepDETAILS(pl.LightningModule):
                  prior_loss_coef: float = 1., learning_rate: float = 1e-3, version: str = "",
                  scale_function_placement: str = "disable", t_x: int = 4096, test_screenshot_ratio: float = 0.002,
                  gamma: float = 1e-8, n_times_more_embeddings: int = 2, betas: Tuple[float, float] = (0.9, 0.999),
-                 seq_only: Optional[bool] = False, first_pass: Optional[bool] = None) -> None:
+                 seq_only: Optional[bool] = False, first_pass: Optional[bool] = None,
+                 atac_hidden: int = 64, atac_dropout: float = 0.0,
+                 film_tanh_scale: float = 0.1) -> None:
         super().__init__()
         self.save_hyperparameters()
         self.num_cell_types = num_cell_types
@@ -34,16 +36,22 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         self.first_pass = first_pass
 
         if seq_only:
-            raise ValueError("Not implemented yet")
+            self.model = SupervisedSeqOnlyRegressor(
+                num_cell_types=num_cell_types, filters=filters,
+                n_non_dil_layers=n_non_dil_layers, non_dil_kernel_size=non_dil_kernel_size,
+                n_dil_layers=n_dil_layers, dil_kernel_size=dil_kernel_size,
+                conv1_kernel_size=conv1_kernel_size, profile_kernel_size=profile_kernel_size,
+                counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks,
+                scale_function_placement=scale_function_placement
+            )
         else:
-            self.model = SupervisedRegressor(
+            self.model = SupervisedFiLMRegressor(
                 num_cell_types=num_cell_types, filters=filters,
                 n_non_dil_layers=n_non_dil_layers, non_dil_kernel_size=non_dil_kernel_size,
                 n_dil_layers=n_dil_layers, dil_kernel_size=dil_kernel_size, profile_shrinkage=profile_shrinkage,
                 conv1_kernel_size=conv1_kernel_size, profile_kernel_size=profile_kernel_size,
-                gru_layers=gru_layers, gru_dropout=gru_dropout, n_times_more_embeddings=n_times_more_embeddings,
-                counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks,
-                scale_function_placement=scale_function_placement)
+                n_times_more_embeddings=n_times_more_embeddings, atac_hidden=atac_hidden, atac_dropout=atac_dropout, 
+                film_tanh_scale=film_tanh_scale, counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks)
             
         self.profile_loss_func = RMSLELoss()
         self.redundancy_loss_coef = redundancy_loss_coef
@@ -60,8 +68,8 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         self.sum_qc_metrics = torch.zeros(num_cell_types, num_tasks)
         self.enable_sum_qc_metrics = False
 
-    def forward(self, x, loads):
-        return self.model(x, loads)
+    def forward(self, x, loads, return_logits: bool = False):
+        return self.model(x, loads, return_logits=return_logits)
     
     def training_step(self, batch, batch_idx):
         x, expected_counts, expected_profiles, loads = batch
