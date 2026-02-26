@@ -60,6 +60,8 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         self.pearsonr = torchmetrics.PearsonCorrCoef()
         self.val_pearsonr = torchmetrics.PearsonCorrCoef()
         self.test_pearsonr = torchmetrics.PearsonCorrCoef()
+        self.train_pc_pearsons = torch.nn.ModuleList([torchmetrics.PearsonCorrCoef() for _ in range(num_cell_types)])
+        self.val_pc_pearsons = torch.nn.ModuleList([torchmetrics.PearsonCorrCoef() for _ in range(num_cell_types)])
         self.test_pc_pearsons = torch.nn.ModuleList([torchmetrics.PearsonCorrCoef() for _ in range(num_cell_types)])
         self.version = version
         self.test_screenshot_ratio = test_screenshot_ratio
@@ -67,15 +69,49 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         self.self_qc_values = []
         self.sum_qc_metrics = torch.zeros(num_cell_types, num_tasks)
         self.enable_sum_qc_metrics = False
+        self._debug_printed = False
 
     def forward(self, x, loads, return_logits: bool = False):
         return self.model(x, loads, return_logits=return_logits)
     
     def training_step(self, batch, batch_idx):
         x, expected_counts, expected_profiles, loads = batch
+        if (not self._debug_printed) and (batch_idx == 0):
+            self._debug_printed = True
+
+            k562_idx = 3
+            a673_idx = 0
+            
+            yk = expected_counts[:, k562_idx]
+            ya = expected_counts[:, a673_idx]
+            
+            def stats(t):
+                t2 = t.detach()
+                return dict(
+                    mean=float(t2.mean().cpu()),
+                    std=float(t2.std().cpu()),
+                    gt0=float((t2 > 0).float().mean().cpu()),
+                    has_nan=bool(torch.isnan(t2).any().cpu()),
+                    has_inf=bool(torch.isinf(t2).any().cpu()),
+                    min=float(t2.min().cpu()),
+                    max=float(t2.max().cpu()),
+                )
+            
+            print("[DEBUG] y_true A673 mean/std/>0:", stats(ya))
+            print("[DEBUG] y_true K562 mean/std/>0:", stats(yk))
+
         pc_profiles, pc_counts, _, _ = self.model(x, loads)
 
         ct_preds = calc_counts_per_locus(pc_profiles, pc_counts, True)
+
+        if batch_idx == 0 and self.current_epoch == 0:
+            for i in range(self.num_cell_types):
+                p = ct_preds[i].detach()
+                t = expected_profiles[:, i].detach()
+                print(f"[DEBUG] ct{i} pred std/min/max/nan:",
+                    float(p.std().cpu()), float(p.min().cpu()), float(p.max().cpu()), bool(torch.isnan(p).any().cpu()))
+                print(f"[DEBUG] ct{i} targ std/min/max/nan:",
+                    float(t.std().cpu()), float(t.min().cpu()), float(t.max().cpu()), bool(torch.isnan(t).any().cpu()))
 
         losses = [
             self.profile_loss_func(ct_preds[i], expected_profiles[:, i])
@@ -86,10 +122,13 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         for i in range(self.num_cell_types):
             pred = ct_preds[i]  # shape: [B, 2, L]
             target = expected_profiles[:, i, :, :]
-            corr = self.pearsonr(pred.flatten(), target.flatten())
+            if pred.std() < 1e-8 or target.std() < 1e-8:
+                corr = torch.tensor(float("nan"), device=pred.device)
+            else:
+                corr = self.train_pc_pearsons[i](pred.flatten(), target.flatten())
             self.log(f"tr_corr_{i}", corr, on_epoch=True, prog_bar=False)
             cell_type_corrs.append(corr)
-        train_mean_corr = torch.stack(cell_type_corrs).mean()
+        train_mean_corr = torch.nanmean(torch.stack(cell_type_corrs))
         self.log("train_corr", train_mean_corr, on_epoch=True, prog_bar=True)
 
         msle_loss = torch.stack(losses).mean()
@@ -137,7 +176,10 @@ class SupervisedDeepDETAILS(pl.LightningModule):
             pred = ct_preds[i]                   # shape: [B, 2, L]
             target = expected_profiles[:, i]     # shape: [B, 2, L]
 
-            corr = self.val_pearsonr(pred.flatten(), target.flatten())
+            if pred.std() < 1e-8 or target.std() < 1e-8:
+                corr = torch.tensor(float("nan"), device=pred.device)
+            else:
+                corr = self.val_pc_pearsons[i](pred.flatten(), target.flatten())
             self.log(f"vcorr_{i}", corr, prog_bar=True)
             cell_type_corrs.append(corr)
         valid_corrs = [c for c in cell_type_corrs if not torch.isnan(c)]
@@ -177,7 +219,10 @@ class SupervisedDeepDETAILS(pl.LightningModule):
             pred = ct_preds[i]                   # shape: [B, 2, L]
             target = expected_profiles[:, i]     # shape: [B, 2, L]
 
-            corr = self.test_pearsonr(pred.flatten(), target.flatten())
+            if pred.std() < 1e-8 or target.std() < 1e-8:
+                corr = torch.tensor(float("nan"), device=pred.device)
+            else:
+                corr = self.test_pc_pearsons[i](pred.flatten(), target.flatten())
             self.log(f"testcorr_{i}", corr, prog_bar=True)
             cell_type_corrs.append(corr)
 

@@ -747,7 +747,7 @@ def prepare_dataset(regions: Sequence[str], bulk_pl: str, save_to: str, window_s
 
             logger.info("Generating pseudo-bulk bigWig files based on their source cell type / cluster...")
             for ct, ctf in _ct_frag_dict.items():
-                frag_file_to_bw(ctf, frag_proc="naive", chrom_size=chrom_size, n_frags=_frags_per_ct[ct])
+                frag_file_to_bw(ctf, frag_proc="5pi", chrom_size=chrom_size, n_frags=_frags_per_ct[ct])
             logger.info("Finished generating pseudo-bulk bigWig files based on their source cell type / cluster...")
 
             accessibility = []

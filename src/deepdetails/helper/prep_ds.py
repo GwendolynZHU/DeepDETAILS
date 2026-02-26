@@ -690,9 +690,11 @@ def convert_bulk_frags_to_ct_frags(fragments_file: str, barcode_file: str, save_
     cell_types = sorted(barcodes[1].unique().tolist())
     print(f"Cell types in the barcode file: {cell_types}")
     safe_cell_types_mapping = {ct: slugify(ct) for ct in cell_types}
+    # print(f"Safe cell types mapping: {safe_cell_types_mapping}")
     if reference_labels is not None:
         safe_ref_labels = [slugify(r) for r in reference_labels]
-        if safe_ref_labels != set(safe_cell_types_mapping.values()):
+        # print(f"Reference labels provided: {reference_labels}")
+        if safe_ref_labels != list(safe_cell_types_mapping.values()):
             raise ValueError("Reference labels provided do not match cell types")
         cell_types = reference_labels
         safe_cell_types_mapping = {ct: slugify(ct) for ct in cell_types}

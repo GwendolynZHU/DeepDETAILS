@@ -1,3 +1,4 @@
+from math import gamma
 import torch
 from typing import Tuple
 from torch import nn
@@ -653,7 +654,7 @@ class SupervisedFiLMRegressor(nn.Module):
         self.atac_conditioners = nn.ModuleList([
             ATACToProfilesAndFiLM(
                 profile_channels=2 * n_profile_filters, # because of bidirectional GRU
-                motif_channels=n_profile_filters * n_times_more_embeddings,
+                motif_channels=filters * n_times_more_embeddings,
                 hidden=atac_hidden,
                 dropout=atac_dropout,
                 film_tanh_scale=film_tanh_scale,
@@ -669,6 +670,8 @@ class SupervisedFiLMRegressor(nn.Module):
                     shape_filters=filters, profile_kernel_size=profile_kernel_size,
                     counts_head_mlp_layers=counts_head_mlp_layers, num_tasks=num_tasks
                 ))
+        
+        self._last_film = {}
 
     def forward(self, x: Tuple[torch.Tensor, torch.Tensor], per_cluster_load: torch.Tensor,
                 return_logits: bool = False) -> tuple[
@@ -702,11 +705,22 @@ class SupervisedFiLMRegressor(nn.Module):
         per_cell_type_counts = []
         per_cell_type_activations = []
 
+        N = 200
+        if not hasattr(self, "_dbg_batch_step"):
+            self._dbg_batch_step = 0
+        self._dbg_batch_step += 1
+        do_print = (self._dbg_batch_step % N == 0)
+
         for cell_type_id in range(self.num_cell_types):
             cw = cluster_weights[:, cell_type_id]
             
             atac_ct = atac[:, cell_type_id, :].unsqueeze(1) # shape: batch, 1, seq_len
             profiles, gamma, beta = self.atac_conditioners[cell_type_id](atac_ct)
+
+            self._last_film[cell_type_id] = {
+                "gamma": gamma.detach(),
+                "beta": beta.detach(),
+            }
 
             profiles = profiles[:, :, atac_truncation:-atac_truncation]  # (B, P, motifs_len)
             gamma    = gamma[:, :, atac_truncation:-atac_truncation]     # (B, C, motifs_len)
@@ -723,5 +737,28 @@ class SupervisedFiLMRegressor(nn.Module):
             per_cell_type_profiles.append(per_cell_type_profile)
             per_cell_type_counts.append(per_cell_type_count)
             per_cell_type_activations.append(gates)
+
+            if do_print:
+                with torch.no_grad():
+                    # gamma/beta: [B, C(=1024), L]
+                    g = gamma.detach()
+                    b = beta.detach()
+
+                    abs_g = (g - 1.0).abs()
+                    abs_b = b.abs()
+
+                    # 95th percentile
+                    p95_g = torch.quantile(abs_g.reshape(-1), 0.95).item()
+                    p95_b = torch.quantile(abs_b.reshape(-1), 0.95).item()
+
+                    mean_g = abs_g.mean().item()
+                    mean_b = abs_b.mean().item()
+
+                    # saturation fraction near bounds (因为你 scale=0.1，所以边界是 0.9 和 1.1)
+                    sat = ((g <= 0.9001) | (g >= 1.0999)).float().mean().item()
+
+                    print(f"[FiLM batch={self._dbg_batch_step} ct={cell_type_id}] |gamma-1| mean={mean_g:.4f} p95={p95_g:.4f} sat={sat:.3f} |beta| mean={mean_b:.4f} p95={p95_b:.4f}")
+                    if cell_type_id in [0, 3]:
+                        print(f"[Profile batch={self._dbg_batch_step} ct={cell_type_id}] count mean={per_cell_type_count.mean().item():.4f} std={per_cell_type_count.std().item():.4f}")
 
         return per_cell_type_profiles, per_cell_type_counts, cluster_weights, per_cell_type_activations
