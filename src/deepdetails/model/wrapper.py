@@ -5,7 +5,7 @@ from typing import Tuple, Optional
 from einops import rearrange
 from deepdetails.helper.inspection import bulk_visual_inspection, per_cluster_visual_inspection, gt_visual_inspection
 from deepdetails.model.loss import RMSLELoss, off_diagonal
-from deepdetails.model.deconvolution import Regressor, SeqOnlyRegressor, SupervisedRegressor, SupervisedSeqOnlyRegressor, SupervisedFiLMRegressor
+from deepdetails.model.deconvolution import Regressor, SeqOnlyRegressor, SupervisedRegressor, SupervisedSeqOnlyRegressor, SupervisedFiLMRegressor, SupervisedModulationOnlyRegressor
 from deepdetails.helper.utils import transform_counts, calc_counts_per_locus
 from deepdetails.par_description import PARAM_DESC
 
@@ -19,9 +19,10 @@ class SupervisedDeepDETAILS(pl.LightningModule):
                  prior_loss_coef: float = 1., learning_rate: float = 1e-3, version: str = "",
                  scale_function_placement: str = "disable", t_x: int = 4096, test_screenshot_ratio: float = 0.002,
                  gamma: float = 1e-8, n_times_more_embeddings: int = 2, betas: Tuple[float, float] = (0.9, 0.999),
-                 seq_only: Optional[bool] = False, first_pass: Optional[bool] = None,
-                 atac_hidden: int = 64, atac_dropout: float = 0.0,
-                 film_tanh_scale: float = 0.1) -> None:
+                 seq_only: Optional[bool] = False, modulation_only: Optional[bool] = False,
+                 first_pass: Optional[bool] = None, atac_hidden: int = 64, atac_dropout: float = 0.0,
+                 film_tanh_scale: float = 0.1, film_position_resolved: bool = False,
+                 film_input_norm: str = "none") -> None:
         super().__init__()
         self.save_hyperparameters()
         self.num_cell_types = num_cell_types
@@ -44,14 +45,28 @@ class SupervisedDeepDETAILS(pl.LightningModule):
                 counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks,
                 scale_function_placement=scale_function_placement
             )
+        elif modulation_only:
+            self.model = SupervisedModulationOnlyRegressor(
+                num_cell_types=num_cell_types, filters=filters,
+                n_non_dil_layers=n_non_dil_layers, non_dil_kernel_size=non_dil_kernel_size,
+                n_dil_layers=n_dil_layers, dil_kernel_size=dil_kernel_size,
+                conv1_kernel_size=conv1_kernel_size, profile_kernel_size=profile_kernel_size,
+                counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks,
+                scale_function_placement=scale_function_placement,
+                atac_hidden=atac_hidden, atac_dropout=atac_dropout,
+                film_tanh_scale=film_tanh_scale,
+                position_resolved=film_position_resolved,
+                input_norm=film_input_norm,
+            )
         else:
             self.model = SupervisedFiLMRegressor(
                 num_cell_types=num_cell_types, filters=filters,
                 n_non_dil_layers=n_non_dil_layers, non_dil_kernel_size=non_dil_kernel_size,
                 n_dil_layers=n_dil_layers, dil_kernel_size=dil_kernel_size, profile_shrinkage=profile_shrinkage,
                 conv1_kernel_size=conv1_kernel_size, profile_kernel_size=profile_kernel_size,
-                n_times_more_embeddings=n_times_more_embeddings, atac_hidden=atac_hidden, atac_dropout=atac_dropout, 
-                film_tanh_scale=film_tanh_scale, counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks)
+                n_times_more_embeddings=n_times_more_embeddings, atac_hidden=atac_hidden, atac_dropout=atac_dropout,
+                film_tanh_scale=film_tanh_scale, counts_head_mlp_layers=head_mlp_layers, num_tasks=num_tasks,
+                input_norm=film_input_norm)
             
         self.profile_loss_func = RMSLELoss()
         self.redundancy_loss_coef = redundancy_loss_coef
@@ -74,61 +89,58 @@ class SupervisedDeepDETAILS(pl.LightningModule):
     def forward(self, x, loads, return_logits: bool = False):
         return self.model(x, loads, return_logits=return_logits)
     
+    def _safe_profile_corr(self, pred: torch.Tensor, target: torch.Tensor,
+                       eps: float = 1e-8, min_total_signal: float = 1.0):
+        informative = target.sum(dim=(1, 2)) > min_total_signal
+        if informative.sum() < 2:
+            return None
+
+        pred = pred[informative].reshape(-1).float()
+        target = target[informative].reshape(-1).float()
+
+        finite = torch.isfinite(pred) & torch.isfinite(target)
+        if finite.sum() < 4:
+            return None
+
+        pred = pred[finite]
+        target = target[finite]
+
+        pred = pred - pred.mean()
+        target = target - target.mean()
+
+        pred_norm = torch.linalg.norm(pred)
+        target_norm = torch.linalg.norm(target)
+
+        if pred_norm <= eps or target_norm <= eps:
+            return None
+
+        corr = (pred * target).sum() / (pred_norm * target_norm)
+        return torch.clamp(corr, -1.0, 1.0)
+
     def training_step(self, batch, batch_idx):
         x, expected_counts, expected_profiles, loads = batch
-        if (not self._debug_printed) and (batch_idx == 0):
-            self._debug_printed = True
-
-            k562_idx = 3
-            a673_idx = 0
-            
-            yk = expected_counts[:, k562_idx]
-            ya = expected_counts[:, a673_idx]
-            
-            def stats(t):
-                t2 = t.detach()
-                return dict(
-                    mean=float(t2.mean().cpu()),
-                    std=float(t2.std().cpu()),
-                    gt0=float((t2 > 0).float().mean().cpu()),
-                    has_nan=bool(torch.isnan(t2).any().cpu()),
-                    has_inf=bool(torch.isinf(t2).any().cpu()),
-                    min=float(t2.min().cpu()),
-                    max=float(t2.max().cpu()),
-                )
-            
-            print("[DEBUG] y_true A673 mean/std/>0:", stats(ya))
-            print("[DEBUG] y_true K562 mean/std/>0:", stats(yk))
 
         pc_profiles, pc_counts, _, _ = self.model(x, loads)
 
         ct_preds = calc_counts_per_locus(pc_profiles, pc_counts, True)
-
-        if batch_idx == 0 and self.current_epoch == 0:
-            for i in range(self.num_cell_types):
-                p = ct_preds[i].detach()
-                t = expected_profiles[:, i].detach()
-                print(f"[DEBUG] ct{i} pred std/min/max/nan:",
-                    float(p.std().cpu()), float(p.min().cpu()), float(p.max().cpu()), bool(torch.isnan(p).any().cpu()))
-                print(f"[DEBUG] ct{i} targ std/min/max/nan:",
-                    float(t.std().cpu()), float(t.min().cpu()), float(t.max().cpu()), bool(torch.isnan(t).any().cpu()))
-
-        losses = [
-            self.profile_loss_func(ct_preds[i], expected_profiles[:, i])
-            for i in range(self.num_cell_types)
-        ]
-
         cell_type_corrs = []
+        losses = []
+
         for i in range(self.num_cell_types):
             pred = ct_preds[i]  # shape: [B, 2, L]
             target = expected_profiles[:, i, :, :]
-            if pred.std() < 1e-8 or target.std() < 1e-8:
-                corr = torch.tensor(float("nan"), device=pred.device)
-            else:
-                corr = self.train_pc_pearsons[i](pred.flatten(), target.flatten())
-            self.log(f"tr_corr_{i}", corr, on_epoch=True, prog_bar=False)
-            cell_type_corrs.append(corr)
-        train_mean_corr = torch.nanmean(torch.stack(cell_type_corrs))
+            loss_i = self.profile_loss_func(pred, target)
+            losses.append(loss_i)
+
+            corr = self._safe_profile_corr(pred, target)
+            if corr is not None:
+                self.log(f"tr_corr_{i}", corr, on_epoch=True, prog_bar=False)
+                cell_type_corrs.append(corr)
+
+        if cell_type_corrs:
+            train_mean_corr = torch.stack(cell_type_corrs).mean()
+        else:
+            train_mean_corr = torch.tensor(0.0, device=self.device)
         self.log("train_corr", train_mean_corr, on_epoch=True, prog_bar=True)
 
         msle_loss = torch.stack(losses).mean()
@@ -176,18 +188,26 @@ class SupervisedDeepDETAILS(pl.LightningModule):
             pred = ct_preds[i]                   # shape: [B, 2, L]
             target = expected_profiles[:, i]     # shape: [B, 2, L]
 
-            if pred.std() < 1e-8 or target.std() < 1e-8:
-                corr = torch.tensor(float("nan"), device=pred.device)
-            else:
-                corr = self.val_pc_pearsons[i](pred.flatten(), target.flatten())
-            self.log(f"vcorr_{i}", corr, prog_bar=True)
-            cell_type_corrs.append(corr)
-        valid_corrs = [c for c in cell_type_corrs if not torch.isnan(c)]
-        if valid_corrs:
-            val_mean_corr = torch.stack(valid_corrs).mean()
+            corr = self._safe_profile_corr(pred, target)
+            if corr is not None:
+                self.log(f"vcorr_{i}", corr, prog_bar=True)
+                cell_type_corrs.append(corr)
+
+            # if pred.std() < 1e-8 or target.std() < 1e-8:
+            #     corr = torch.tensor(float("nan"), device=pred.device)
+            # else:
+            #     corr = self.val_pc_pearsons[i](pred.flatten(), target.flatten())
+            # self.log(f"vcorr_{i}", corr, prog_bar=True)
+            # cell_type_corrs.append(corr)
+        # valid_corrs = [c for c in cell_type_corrs if not torch.isnan(c)]
+        # if valid_corrs:
+        #     val_mean_corr = torch.stack(valid_corrs).mean()
+        # else:
+        #     val_mean_corr = torch.tensor(0.0, device=self.device)
+        if cell_type_corrs:
+            val_mean_corr = torch.stack(cell_type_corrs).mean()
         else:
             val_mean_corr = torch.tensor(0.0, device=self.device)
-
         self.log("val_corr", val_mean_corr, prog_bar=True)
 
         if torch.rand(1)[0] < 0.005:
@@ -218,15 +238,23 @@ class SupervisedDeepDETAILS(pl.LightningModule):
         for i in range(self.num_cell_types):
             pred = ct_preds[i]                   # shape: [B, 2, L]
             target = expected_profiles[:, i]     # shape: [B, 2, L]
+            corr = self._safe_profile_corr(pred, target)
 
-            if pred.std() < 1e-8 or target.std() < 1e-8:
-                corr = torch.tensor(float("nan"), device=pred.device)
-            else:
-                corr = self.test_pc_pearsons[i](pred.flatten(), target.flatten())
-            self.log(f"testcorr_{i}", corr, prog_bar=True)
-            cell_type_corrs.append(corr)
+            if corr is not None:
+                self.log(f"testcorr_{i}", corr, prog_bar=True)
+                cell_type_corrs.append(corr)
+        #     if pred.std() < 1e-8 or target.std() < 1e-8:
+        #         corr = torch.tensor(float("nan"), device=pred.device)
+        #     else:
+        #         corr = self.test_pc_pearsons[i](pred.flatten(), target.flatten())
+        #     self.log(f"testcorr_{i}", corr, prog_bar=True)
+        #     cell_type_corrs.append(corr)
 
-        test_mean_corr = torch.stack(cell_type_corrs).mean()
+        # test_mean_corr = torch.stack(cell_type_corrs).mean()
+        if cell_type_corrs:
+            test_mean_corr = torch.stack(cell_type_corrs).mean()
+        else:
+            test_mean_corr = torch.tensor(0.0, device=self.device)
         self.log("test_corr", test_mean_corr, prog_bar=True)
 
         # groundtruth-based evaluation

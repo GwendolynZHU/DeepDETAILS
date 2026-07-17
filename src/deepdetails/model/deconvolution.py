@@ -1,8 +1,23 @@
 from math import gamma
 import torch
-from typing import Tuple
+from typing import Tuple, Optional
 from torch import nn
 from . import ResidualConv, ResidualConvWithXProjection
+
+
+def _norm_atac(atac: torch.Tensor, method: str) -> torch.Tensor:
+    """Variance-stabilizing transform for raw ATAC coverage fed into FiLM.
+
+    Raw coverage spans 0..thousands and saturates the downstream tanh; asinh
+    (the project's default, see helper.utils.transform_counts) / log1p compress
+    the range while preserving relative accessibility. ``method='none'``
+    reproduces the original (un-normalized) behavior.
+    """
+    if method == "asinh":
+        return torch.asinh(atac.clamp(min=0))
+    if method == "log1p":
+        return torch.log1p(atac.clamp(min=0))
+    return atac
 
 
 class BaseRegressor(nn.Module):
@@ -537,9 +552,10 @@ class SupervisedSeqOnlyRegressor(nn.Module):
 
             if self.scale_function_placement == "early":
                 cell_type_profile, cell_type_count = self.per_cluster_heads[cell_type_id](
-                    body * cw[:, None, None])
+                    body * cw[:, None, None], return_logits=return_logits)
             else:
-                cell_type_profile, cell_type_count = self.per_cluster_heads[cell_type_id](body)
+                cell_type_profile, cell_type_count = self.per_cluster_heads[cell_type_id](
+                    body, return_logits=return_logits)
             
             if return_logits:
                 per_cell_type_profiles.append(cell_type_profile)
@@ -555,6 +571,216 @@ class SupervisedSeqOnlyRegressor(nn.Module):
                     per_cell_type_profiles.append(cell_type_profile)
                     per_cell_type_counts.append(cell_type_count)
         
+        return per_cell_type_profiles, per_cell_type_counts, cluster_weights, per_cell_type_activations
+
+class ATACToChannelFiLM(nn.Module):
+    """
+    Encode pseudo-bulk ATAC-seq profiles into channel-wise FiLM parameters.
+
+        pseudo-bulk ATAC: (B, 1, L)
+        gamma, beta: (B, C, 1)  if position_resolved is False (global modulation)
+        gamma, beta: (B, C, L)  if position_resolved is True  (per-position modulation)
+
+    C = motif embedding channels
+
+    Notes
+    -----
+    When ``position_resolved`` is False the ATAC encoding is mean-pooled over the
+    window, so the modulation is a single constant per channel and CANNOT change
+    the profile shape (only a global rescale). Setting ``position_resolved=True``
+    keeps the spatial axis so ATAC can modulate *where* initiation happens.
+    ``film_tanh_scale`` controls the modulation range: gamma in
+    [1 - s, 1 + s], beta in [-s, s]. The old default (0.1) caps modulation at
+    +/-10%, which is often too weak to use the ATAC signal.
+    """
+    def __init__(
+        self,
+        motif_channels: int,
+        hidden: int = 64,
+        k1: int = 25,
+        k2: int = 9,
+        dropout: float = 0.0,
+        film_tanh_scale: float = 0.1,
+        position_resolved: bool = False,
+        input_norm: str = "none",
+    ):
+        super().__init__()
+        self.film_tanh_scale = film_tanh_scale
+        self.position_resolved = position_resolved
+        self.input_norm = input_norm
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, hidden, kernel_size=k1, padding=k1 // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(hidden, hidden, kernel_size=k2, padding=k2 // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.gamma_head = nn.Conv1d(hidden, motif_channels, kernel_size=1)
+        self.beta_head = nn.Conv1d(hidden, motif_channels, kernel_size=1)
+        if input_norm != "none":
+            # When the fixed input handling is on, start from identity
+            # (gamma=1, beta=0) so modulation is learned gradually and cannot
+            # saturate/collapse to a dead head at init.
+            nn.init.zeros_(self.gamma_head.weight)
+            nn.init.zeros_(self.gamma_head.bias)
+            nn.init.zeros_(self.beta_head.weight)
+            nn.init.zeros_(self.beta_head.bias)
+
+    def forward(self, atac: torch.Tensor, out_len: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        atac: torch.Tensor
+            Shape: (B, 1, L)
+        out_len: Optional[int]
+            Target spatial length to (center-)crop the per-position gamma/beta to,
+            so they align with the (shorter) sequence body produced by the valid
+            convolutions. Ignored when ``position_resolved`` is False.
+
+        Returns
+        -------
+        gamma: torch.Tensor
+            Shape: (B, C, 1) if not position_resolved else (B, C, out_len or L)
+        beta: torch.Tensor
+            Same shape as gamma.
+        """
+        atac = _norm_atac(atac, self.input_norm)
+
+        x = self.encoder(atac)
+
+        if self.position_resolved:
+            gamma = self.gamma_head(x)  # (B, C, L)
+            beta = self.beta_head(x)    # (B, C, L)
+            if out_len is not None and gamma.shape[-1] != out_len:
+                # center-crop to match the body length (valid convs crop symmetrically)
+                off = (gamma.shape[-1] - out_len) // 2
+                gamma = gamma[:, :, off:off + out_len]
+                beta = beta[:, :, off:off + out_len]
+        else:
+            pooled = x.mean(dim=2, keepdim=True)
+            gamma = self.gamma_head(pooled)  # (B, C, 1)
+            beta = self.beta_head(pooled)
+
+        gamma = 1.0 + torch.tanh(gamma) * self.film_tanh_scale
+        beta = torch.tanh(beta) * self.film_tanh_scale
+        return gamma, beta
+
+
+class SupervisedModulationOnlyRegressor(nn.Module):
+    def __init__(self, num_cell_types: int,
+                 filters=512, n_non_dil_layers=0, non_dil_kernel_size=3,
+                 n_dil_layers=8, dil_kernel_size=3, conv1_kernel_size=21,
+                 profile_kernel_size=75, counts_head_mlp_layers=3,
+                 num_tasks=1, scale_function_placement: str = "late-ch",
+                 atac_hidden=64, atac_dropout=0.0, film_tanh_scale=0.1,
+                 position_resolved: bool = False, input_norm: str = "none") -> None:
+        super().__init__()
+        self.num_cell_types = num_cell_types
+        self.position_resolved = position_resolved
+
+        self.motif_detector = nn.Conv1d(
+            4, filters, kernel_size=conv1_kernel_size, padding="valid")
+
+        self.encoder = SeqOnlyBaseRegressor(
+            filters=filters, n_non_dil_layers=n_non_dil_layers,
+            non_dil_kernel_size=non_dil_kernel_size,
+            n_dil_layers=n_dil_layers, dil_kernel_size=dil_kernel_size)
+
+        self.atac_conditioners = nn.ModuleList([
+            ATACToChannelFiLM(
+                motif_channels=filters,
+                hidden=atac_hidden,
+                dropout=atac_dropout,
+                film_tanh_scale=film_tanh_scale,
+                position_resolved=position_resolved,
+                input_norm=input_norm,
+            )
+            for _ in range(num_cell_types)
+        ])
+
+        self.per_cluster_heads = nn.ModuleList()
+        for _ in range(self.num_cell_types):
+            self.per_cluster_heads.append(
+                PerClusterHeadSeqOnly(
+                    shape_filters=filters, profile_kernel_size=profile_kernel_size,
+                    head_layers=counts_head_mlp_layers, num_tasks=num_tasks
+                ))
+
+        self.scale_function_placement = scale_function_placement
+        self._last_film = {}
+        self._film_attribution_mode = "normal"
+
+    def forward(self, x: Tuple[torch.Tensor, torch.Tensor], per_cluster_load: torch.Tensor,
+                return_logits: bool = False) -> tuple[
+        list[torch.Tensor], list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
+        """
+        Parameters
+        ----------
+        x : Tuple[torch.Tensor, torch.Tensor]
+            seq: Shape: batch, ATCG, window_size
+            atac: Shape: batch, n_cell_types, window_size
+        per_cluster_load : torch.Tensor
+            Prior about per cluster loads
+        return_logits : bool
+            Whether to return raw logits before activation functions.
+
+        Returns
+        -------
+        tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, list[torch.Tensor]]
+            1. First element is per cluster profile (Shape: batch, strands, window_size).
+            2. Second element is per cluster counts (Shape: batch, strands).
+            3. Per cluster weights (Shape: batch, n_clusters)
+            4. Placeholder per-cluster activations (empty list for interface compatibility).
+        """
+        seq, atac = x
+        motifs = self.motif_detector(seq)
+        body = self.encoder(motifs)
+
+        cluster_weights = per_cluster_load
+        per_cell_type_profiles = []
+        per_cell_type_counts = []
+        per_cell_type_activations = []
+
+        for cell_type_id in range(self.num_cell_types):
+            cw = cluster_weights[:, cell_type_id]
+            atac_ct = atac[:, cell_type_id, :].unsqueeze(1)
+            gamma, beta = self.atac_conditioners[cell_type_id](atac_ct, out_len=body.shape[-1])
+            film_attribution_mode = getattr(self, "_film_attribution_mode", "normal")
+            if film_attribution_mode == "identity":
+                gamma = torch.ones_like(gamma)
+                beta = torch.zeros_like(beta)
+            elif film_attribution_mode != "normal":
+                raise ValueError(f"Unsupported _film_attribution_mode: {film_attribution_mode}")
+
+            self._last_film[cell_type_id] = {
+                "gamma": gamma.detach(),
+                "beta": beta.detach(),
+            }
+
+            modulated_body = body * gamma + beta
+
+            if self.scale_function_placement == "early":
+                cell_type_profile, cell_type_count = self.per_cluster_heads[cell_type_id](
+                    modulated_body * cw[:, None, None], return_logits=return_logits)
+            else:
+                cell_type_profile, cell_type_count = self.per_cluster_heads[cell_type_id](
+                    modulated_body, return_logits=return_logits)
+
+            if return_logits:
+                per_cell_type_profiles.append(cell_type_profile)
+                per_cell_type_counts.append(cell_type_count)
+            else:
+                if self.scale_function_placement == "late":
+                    per_cell_type_profiles.append(cell_type_profile * cw[:, None, None])
+                    per_cell_type_counts.append(cell_type_count * cw[:, None])
+                elif self.scale_function_placement == "late-ch":
+                    per_cell_type_profiles.append(cell_type_profile)
+                    per_cell_type_counts.append(cell_type_count * cw[:, None])
+                else:
+                    per_cell_type_profiles.append(cell_type_profile)
+                    per_cell_type_counts.append(cell_type_count)
+
         return per_cell_type_profiles, per_cell_type_counts, cluster_weights, per_cell_type_activations
 
 class ATACToProfilesAndFiLM(nn.Module):
@@ -575,9 +801,11 @@ class ATACToProfilesAndFiLM(nn.Module):
         k2: int = 9,
         dropout: float = 0.0,
         film_tanh_scale: float = 0.1,
+        input_norm: str = "none",
     ):
         super().__init__()
         self.film_tanh_scale = film_tanh_scale
+        self.input_norm = input_norm
         self.encoder = nn.Sequential(
             nn.Conv1d(1, hidden, kernel_size=k1, padding=k1//2),
             nn.ReLU(),
@@ -589,6 +817,13 @@ class ATACToProfilesAndFiLM(nn.Module):
         self.gamma_head = nn.Conv1d(hidden, motif_channels, kernel_size=1)
         self.beta_head = nn.Conv1d(hidden, motif_channels, kernel_size=1)
         self.profile_head = nn.Conv1d(hidden, profile_channels, kernel_size=1)
+        if input_norm != "none":
+            # Start modulation from identity (gamma=1, beta=0); leave the
+            # additive profile_head at its default init.
+            nn.init.zeros_(self.gamma_head.weight)
+            nn.init.zeros_(self.gamma_head.bias)
+            nn.init.zeros_(self.beta_head.weight)
+            nn.init.zeros_(self.beta_head.bias)
 
     def forward(self, atac: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -604,6 +839,7 @@ class ATACToProfilesAndFiLM(nn.Module):
         beta: torch.Tensor
             Shape: (B, C, L)
         """
+        atac = _norm_atac(atac, self.input_norm)
         x = self.encoder(atac)  # (B, hidden, L)
         profile = self.profile_head(x)  # (B, P, L)
 
@@ -619,8 +855,9 @@ class SupervisedFiLMRegressor(nn.Module):
     def __init__(self, num_cell_types: int, profile_shrinkage=8, filters=512, n_non_dil_layers=0, non_dil_kernel_size=3,
                  n_dil_layers=8, dil_kernel_size=3, conv1_kernel_size=21, profile_kernel_size=75,
                  counts_head_mlp_layers=3, num_tasks=2, n_times_more_embeddings=2,
-                 atac_hidden=64, atac_dropout=0.0, film_tanh_scale=0.1) -> None:
-        
+                 atac_hidden=64, atac_dropout=0.0, film_tanh_scale=0.1,
+                 input_norm: str = "none") -> None:
+
         super().__init__()
         self.num_cell_types = num_cell_types
         n_profile_filters = int(filters / profile_shrinkage)
@@ -658,6 +895,7 @@ class SupervisedFiLMRegressor(nn.Module):
                 hidden=atac_hidden,
                 dropout=atac_dropout,
                 film_tanh_scale=film_tanh_scale,
+                input_norm=input_norm,
             )
             for _ in range(num_cell_types)
         ])
@@ -672,6 +910,7 @@ class SupervisedFiLMRegressor(nn.Module):
                 ))
         
         self._last_film = {}
+        self._film_attribution_mode = "normal"
 
     def forward(self, x: Tuple[torch.Tensor, torch.Tensor], per_cluster_load: torch.Tensor,
                 return_logits: bool = False) -> tuple[
@@ -705,26 +944,26 @@ class SupervisedFiLMRegressor(nn.Module):
         per_cell_type_counts = []
         per_cell_type_activations = []
 
-        N = 200
-        if not hasattr(self, "_dbg_batch_step"):
-            self._dbg_batch_step = 0
-        self._dbg_batch_step += 1
-        do_print = (self._dbg_batch_step % N == 0)
-
         for cell_type_id in range(self.num_cell_types):
             cw = cluster_weights[:, cell_type_id]
             
             atac_ct = atac[:, cell_type_id, :].unsqueeze(1) # shape: batch, 1, seq_len
             profiles, gamma, beta = self.atac_conditioners[cell_type_id](atac_ct)
 
+            profiles = profiles[:, :, atac_truncation:-atac_truncation]  # (B, P, motifs_len)
+            gamma    = gamma[:, :, atac_truncation:-atac_truncation]     # (B, C, motifs_len)
+            beta     = beta[:, :, atac_truncation:-atac_truncation]      # (B, C, motifs_len)
+            film_attribution_mode = getattr(self, "_film_attribution_mode", "normal")
+            if film_attribution_mode == "identity":
+                gamma = torch.ones_like(gamma)
+                beta = torch.zeros_like(beta)
+            elif film_attribution_mode != "normal":
+                raise ValueError(f"Unsupported _film_attribution_mode: {film_attribution_mode}")
+
             self._last_film[cell_type_id] = {
                 "gamma": gamma.detach(),
                 "beta": beta.detach(),
             }
-
-            profiles = profiles[:, :, atac_truncation:-atac_truncation]  # (B, P, motifs_len)
-            gamma    = gamma[:, :, atac_truncation:-atac_truncation]     # (B, C, motifs_len)
-            beta     = beta[:, :, atac_truncation:-atac_truncation]      # (B, C, motifs_len)
 
             gates = torch.sigmoid(self.filter_gates[cell_type_id](motifs_gap)) # shape: batch, filters_1 (1024)
             filtered_activations = motifs * gates[:, :, None]
@@ -737,28 +976,5 @@ class SupervisedFiLMRegressor(nn.Module):
             per_cell_type_profiles.append(per_cell_type_profile)
             per_cell_type_counts.append(per_cell_type_count)
             per_cell_type_activations.append(gates)
-
-            if do_print:
-                with torch.no_grad():
-                    # gamma/beta: [B, C(=1024), L]
-                    g = gamma.detach()
-                    b = beta.detach()
-
-                    abs_g = (g - 1.0).abs()
-                    abs_b = b.abs()
-
-                    # 95th percentile
-                    p95_g = torch.quantile(abs_g.reshape(-1), 0.95).item()
-                    p95_b = torch.quantile(abs_b.reshape(-1), 0.95).item()
-
-                    mean_g = abs_g.mean().item()
-                    mean_b = abs_b.mean().item()
-
-                    # saturation fraction near bounds (因为你 scale=0.1，所以边界是 0.9 和 1.1)
-                    sat = ((g <= 0.9001) | (g >= 1.0999)).float().mean().item()
-
-                    print(f"[FiLM batch={self._dbg_batch_step} ct={cell_type_id}] |gamma-1| mean={mean_g:.4f} p95={p95_g:.4f} sat={sat:.3f} |beta| mean={mean_b:.4f} p95={p95_b:.4f}")
-                    if cell_type_id in [0, 3]:
-                        print(f"[Profile batch={self._dbg_batch_step} ct={cell_type_id}] count mean={per_cell_type_count.mean().item():.4f} std={per_cell_type_count.std().item():.4f}")
 
         return per_cell_type_profiles, per_cell_type_counts, cluster_weights, per_cell_type_activations
