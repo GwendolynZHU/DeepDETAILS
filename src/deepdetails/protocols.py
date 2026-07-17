@@ -37,15 +37,23 @@ def superv_contrastive(regions: str, fa_file: str, acc_bw_files: str, pl_ct_bw_f
            scale_function_placement: str, learning_rate: float, betas: Tuple[float, float],
            window_size: int = 4096, all_regions: bool = True, test_pos_only: bool = True, max_retry: int = 3,
            cv: Sequence[str] = ("chr22",), ct: Sequence[str] = ("chr19",), n_times_more_embeddings: int = 2,
-           seq_only: Optional[bool] = False, loads_trunc: Optional[int] = None):
+           seq_only: Optional[bool] = False, modulation_only: Optional[bool] = False,
+           loads_trunc: Optional[int] = None, seed: Optional[int] = None,
+           film_tanh_scale: float = 0.1, film_position_resolved: bool = False,
+           film_input_norm: str = "none"):
     """
     Use supervised contrastive learning to train a model with DETAILS previous architecture designs.
     """
     logger.info(f"Running supervised contrastive DeepDETAILS on sample {regions} (software version: {__version__})")
     if seq_only:
         logger.info("Supervised contrastive deepDETAILS is running in sequence only mode")
+    if modulation_only:
+        logger.info("Supervised contrastive deepDETAILS is running in modulation only mode")
     if chrom_cv:
         logger.info(f"Using {cv} for validation and {ct} for testing")
+    if seed is not None:
+        logger.info(f"Setting random seed to {seed}")
+        pl.seed_everything(seed, workers=True)
     ds = MultiTaskSupervisedDataset(
         regions, fa_file, acc_bw_files, pl_ct_bw_files, mn_ct_bw_files, cell_types, y_length=y_length, is_training=1, non_background_only=not all_regions,
         chromosomal_val=cv if chrom_cv else None, chromosomal_test=ct if chrom_cv else None,
@@ -71,8 +79,14 @@ def superv_contrastive(regions: str, fa_file: str, acc_bw_files: str, pl_ct_bw_f
     #                          study_name=study_name,
     #                          device=f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu")
     
+    dataloader_generator = None
+    if seed is not None:
+        dataloader_generator = torch.Generator()
+        dataloader_generator.manual_seed(seed)
+
     train_iter = DataLoader(ds, batch_size=batch_size, shuffle=True,
-                            num_workers=num_workers, pin_memory=True)
+                            num_workers=num_workers, pin_memory=True,
+                            generator=dataloader_generator)
     val_iter = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True)
     test_iter = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
@@ -106,7 +120,9 @@ def superv_contrastive(regions: str, fa_file: str, acc_bw_files: str, pl_ct_bw_f
                             n_times_more_embeddings=n_times_more_embeddings,
                             learning_rate=learning_rate, betas=betas,
                             version=ver, t_x=ds.t_x, test_screenshot_ratio=test_screenshots_ratio,
-                            gamma=gamma, seq_only=seq_only)
+                            gamma=gamma, seq_only=seq_only, modulation_only=modulation_only,
+                            film_tanh_scale=film_tanh_scale, film_position_resolved=film_position_resolved,
+                            film_input_norm=film_input_norm)
 
         logger.info("Start building model...")
         trainer.fit(model, train_dataloaders=train_iter, val_dataloaders=val_iter)
@@ -142,9 +158,10 @@ def superv_contrastive(regions: str, fa_file: str, acc_bw_files: str, pl_ct_bw_f
     if save_preds:
         ckpt_path = getattr(trainer.checkpoint_callback, "best_model_path", None)
         if os.path.exists(ckpt_path):
-            logger.info(f"Exporting predictions using checkpoint from {ckpt_path}...")
+            export_dir = os.path.dirname(ckpt_path)
+            logger.info(f"Exporting predictions using checkpoint from {ckpt_path} to {export_dir}...")
             export_multitask_predictions(SupervisedDeepDETAILS, test_ds, ckpt_path, batch_size, num_workers=num_workers,
-                           save_to=save_to, cell_types=cell_types, study_name=study_name,
+                           save_to=export_dir, cell_types=cell_types, study_name=study_name,
                            y_length=y_length, device=f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu")
         else:
             logger.warning(f"Checkpoint file {ckpt_path} doesn't exist anymore... Maybe model collapsed?")

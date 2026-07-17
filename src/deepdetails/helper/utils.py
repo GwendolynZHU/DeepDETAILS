@@ -244,6 +244,7 @@ def get_suprv_trainer(study_name: str, save_to: str = ".", min_delta: float = 0,
         max_epochs=max_epochs,
         accelerator=accelerator, devices=devices,
         callbacks=callbacks,
+        deterministic=True,
         enable_progress_bar=False if hide_progress_bar else True
     )
     return trainer_obj, wbl.version

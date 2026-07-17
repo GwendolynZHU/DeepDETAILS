@@ -83,6 +83,7 @@ def _supervised_training_parser(parent_parser: argparse.ArgumentParser):
     group.add_argument("-v", "--version-tag", dest="version", help=PARAM_DESC["wandb_version"],
                        type=str, default="")
     group.add_argument("--loads-trunc", required=False, type=int, help=PARAM_DESC["loads_trunc"])
+    group.add_argument("--seed", required=False, type=int, default=None, help=PARAM_DESC["seed"])
 
 
 def _training_parser(parent_parser: argparse.ArgumentParser):
@@ -162,10 +163,31 @@ def _model_conf_parser(parent_parser: argparse.ArgumentParser):
                        type=int, default=9)
     group.add_argument("--scale-function-placement", choices=("early", "late", "late-ch", "disable"),
                        help=PARAM_DESC["scale_function_placement"], default="late-ch")
-    group.add_argument("--seq", dest="seq_only", action="store_true", required=False,
-                       help=PARAM_DESC["seq_only"])
+    mode_group = group.add_mutually_exclusive_group()
+    mode_group.add_argument("--seq", dest="seq_only", action="store_true", required=False,
+                            help=PARAM_DESC["seq_only"])
+    mode_group.add_argument("--modulation-only", dest="modulation_only", action="store_true", required=False,
+                            help=PARAM_DESC["modulation_only"])
     group.add_argument("--n-times-more-embeddings", help=PARAM_DESC["n_times_more_embeddings"],
                        type=int, default=2)
+
+
+def _film_parser(parent_parser: argparse.ArgumentParser):
+    group = parent_parser.add_argument_group("FiLM (ATAC modulation)")
+    group.add_argument("--film-tanh-scale", dest="film_tanh_scale", type=float, default=0.1,
+                       help="Modulation range for FiLM: gamma in [1-s, 1+s], beta in [-s, s]. "
+                            "Default 0.1 caps modulation at +/-10%% (often too weak to use ATAC); "
+                            "try 0.5 or 1.0.")
+    group.add_argument("--film-position-resolved", dest="film_position_resolved", action="store_true",
+                       help="Keep the spatial axis in modulation-only FiLM (per-position gamma/beta) so "
+                            "ATAC can modulate profile shape, not just a global per-channel rescale. "
+                            "Only affects --modulation-only (full FiLM is already position-resolved).")
+    group.add_argument("--film-input-norm", dest="film_input_norm", choices=("none", "asinh", "log1p"),
+                       default="none",
+                       help="Transform raw ATAC before the FiLM conditioner (both modulation-only and "
+                            "full FiLM). Raw coverage saturates the tanh; 'asinh' (project default) / "
+                            "'log1p' compress the range and also switch on identity-init of gamma/beta. "
+                            "'none' reproduces the original behavior.")
 
 
 def _wandb_parser(parent_parser: argparse.ArgumentParser):
@@ -324,6 +346,7 @@ def deepdetails():
     _general_parser(parser_train)
     _supervised_training_parser(parser_train)
     _model_conf_parser(parser_train)
+    _film_parser(parser_train)
     _wandb_parser(parser_train)
 
     # Subparser for deconvolution

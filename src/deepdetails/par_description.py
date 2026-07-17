@@ -6,6 +6,7 @@ PARAM_DESC = {
     "y_length": "Length of the final prediction",
     "first_pass": "First pass of the training",
     "seq_only": "Use sequence only model",
+    "modulation_only": "Use chromatin to modulate sequence embeddings without direct chromatin fusion into prediction heads",
     "redundancy_loss_coef": "Redundancy loss coefficient",
     "prior_loss_coef": "Prior loss coefficient",
     "disable_final_rescaling": "By default, DETAILS adjusts the final exported predictions so they have scales identical"
